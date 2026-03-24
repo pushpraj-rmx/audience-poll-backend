@@ -46,6 +46,8 @@ const allowedOrigins = new Set([
   "https://f.urmap.space",
   "http://s.urmap.space",
   "https://s.urmap.space",
+  "https://audiencevotes.com",
+  "https://backend.audiencevotes.com"
 ]);
 
 app.use(

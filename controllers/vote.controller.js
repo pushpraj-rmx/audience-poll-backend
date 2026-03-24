@@ -454,6 +454,11 @@ exports.castVote = async (req, res) => {
         seasonId,
         participantId,
         roundName,
+        stars,
+        voterName:
+          voter?.voterDetails?.name ||
+          loggedInVoter?.name ||
+          "Audience",
       });
     }
 
@@ -1612,6 +1617,8 @@ exports.submitFinalVote = async (req, res) => {
         seasonId: qrData.seasonId,
         participantId: qrData.participantId,
         roundName: roundNameForKeys,
+        stars: Number(vote?.stars || stars || 0),
+        voterName: vote?.voterDetails?.name || "Audience",
       };
       io.to(qrData.seasonId.toString()).emit("vote-updated", payload);
       io.to(qrData.contestId.toString()).emit("vote-updated", payload);
