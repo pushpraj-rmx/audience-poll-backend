@@ -113,6 +113,24 @@ voterId: {
       default: true,
       index: true,
     },
+
+    // 🧾 Audit trail for revokes (optional; used by admin re-vote flow)
+    revokedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+    revokedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    revokeReason: {
+      type: String,
+      trim: true,
+      default: null,
+    },
   },
   { timestamps: true },
 );
