@@ -8,6 +8,8 @@ router.get('/getAllAdmins',protect(["super_admin","admin"]), getAllAdmins)
 router.get('/',protect(["super_admin"]),alladmin)
 router.get('/getAdminsBySeason/:seasonId', getAdminsBySeason)
 
+
+
 // Phase 1 (revote): skeleton endpoint + auth + input validation.
 router.post('/revote', protect(["super_admin", "admin"]), adminRevote)
 
