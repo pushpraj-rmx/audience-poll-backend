@@ -1989,6 +1989,8 @@ exports.getPointTableBySeason = async (req, res) => {
     const voteMatch = {
       seasonId: seasonObjectId,
       participantId: { $ne: null },
+      step: "final",
+      isValid: true,
       ...(roundIdFilter ? { roundId: roundIdFilter } : {}),
     };
 
@@ -2143,7 +2145,12 @@ exports.getPointTableBySeason = async (req, res) => {
         },
       },
 
-      { $sort: { totalPoints: -1 } },
+      {
+        $addFields: {
+          avgStars: { $add: ["$avgAudienceStars", "$avgJudgeStars"] },
+        },
+      },
+      { $sort: { avgStars: -1, totalVotes: -1, totalPoints: -1 } },
     ];
 
     const data = await Vote.aggregate(pipeline);
