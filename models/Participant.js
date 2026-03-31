@@ -56,6 +56,10 @@ const ParticipantSchema = new Schema(
           type: String,
           default: undefined,
         },
+        memberCategory: {
+          type: String,
+          default: undefined,
+        },
         chapterName: {
           type: String,
           default: undefined,

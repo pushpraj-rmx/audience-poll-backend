@@ -113,6 +113,7 @@ exports.createParticipant = async (req, res) => {
       subCategory,
       soloType: rawSoloType,
       memberName,
+      memberCategory,
       chapterName,
       ...rest
     } = req.body;
@@ -215,6 +216,7 @@ exports.createParticipant = async (req, res) => {
       subCategory,
       soloType,
       memberName: memberName || undefined,
+      memberCategory: memberCategory || undefined,
       chapterName: chapterName || undefined,
       groupKey: groupKey || undefined,
     });
@@ -665,6 +667,7 @@ exports.getParticipantBySeason = async (req, res) => {
           category: "$contests.category",
           subCategory: "$contests.subCategory",
           memberName: "$contests.memberName",
+          memberCategory: "$contests.memberCategory",
           chapterName: "$contests.chapterName",
           soloType: "$contests.soloType",
           groupKey: "$contests.groupKey",
@@ -907,6 +910,9 @@ exports.updateParticipantForSeason = async (req, res) => {
       profilePhoto,
       category,
       subCategory,
+      memberName,
+      memberCategory,
+      chapterName,
     } = req.body;
     console.log(req.body, "555555555555555555");
 
@@ -1005,6 +1011,17 @@ exports.updateParticipantForSeason = async (req, res) => {
 
     if (category) contestEntry.category = category;
     if (subCategory !== undefined) contestEntry.subCategory = subCategory;
+    if (memberName !== undefined) {
+      contestEntry.memberName = memberName ? String(memberName).trim() : undefined;
+    }
+    if (memberCategory !== undefined) {
+      contestEntry.memberCategory = memberCategory
+        ? String(memberCategory).trim()
+        : undefined;
+    }
+    if (chapterName !== undefined) {
+      contestEntry.chapterName = chapterName ? String(chapterName).trim() : undefined;
+    }
 
     /* =========================
        6️⃣ UPDATE SEASON.PARTICIPANTS (BY _id)
@@ -1348,6 +1365,10 @@ exports.bulkImportParticipants = async (req, res) => {
       // Doc: Member Name (Column A) + Chapter Name (Column C) + Solo Type (Column F)
       const memberName =
         getValue(row, "memberName") || getValue(row, "member name") || "";
+      const memberCategory =
+        getValue(row, "memberCategory") ||
+        getValue(row, "member category") ||
+        "";
       const chapterName =
         getValue(row, "chapterName") || getValue(row, "chapter name") || getValue(row, "chapter") || "";
       const soloTypeRaw =
@@ -1459,6 +1480,7 @@ exports.bulkImportParticipants = async (req, res) => {
               category,
               subCategory,
               memberName: memberName || undefined,
+              memberCategory: memberCategory || undefined,
               chapterName: chapterName || undefined,
               soloType: expectedSoloType,
               groupKey: groupKey || undefined,
@@ -1688,6 +1710,7 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
       let category = null;
       let participantGroupKey = null;
       let memberName = null;
+      let memberCategory = null;
       let chapterName = null;
       let soloType = null;
 
@@ -1707,6 +1730,7 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
         category = entry?.category || null;
         participantGroupKey = entry?.groupKey || null;
         memberName = entry?.memberName || null;
+        memberCategory = entry?.memberCategory || null;
         chapterName = entry?.chapterName || null;
         soloType = entry?.soloType || null;
       }
@@ -1719,6 +1743,7 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
         category,
         groupKey: participantGroupKey,
         memberName,
+        memberCategory,
         chapterName,
         soloType,
         totalStars: voteMap[p._id.toString()] || 0,
