@@ -29,6 +29,11 @@ const ParticipantSchema = new Schema(
     profilePhoto: {
       type: String,
     },
+    profilePhotos: [
+      {
+        type: String,
+      },
+    ],
 
     bio: {
       type: String,

@@ -1360,23 +1360,43 @@ exports.bulkImportParticipants = async (req, res) => {
       const rawSubCategory =
         getValue(row, "subcategory") ||
         getValue(row, "participationType") ||
-        getValue(row, "participation type");
+        getValue(row, "participation type") ||
+        getValue(row, "participation_type");
 
       // Doc: Member Name (Column A) + Chapter Name (Column C) + Solo Type (Column F)
       const memberName =
-        getValue(row, "memberName") || getValue(row, "member name") || "";
+        getValue(row, "memberName") ||
+        getValue(row, "member name") ||
+        getValue(row, "member_name") ||
+        "";
       const memberCategory =
         getValue(row, "memberCategory") ||
         getValue(row, "member category") ||
+        getValue(row, "member_category") ||
         "";
       const chapterName =
-        getValue(row, "chapterName") || getValue(row, "chapter name") || getValue(row, "chapter") || "";
+        getValue(row, "chapterName") ||
+        getValue(row, "chapter name") ||
+        getValue(row, "chapter_name") ||
+        getValue(row, "chapter") ||
+        "";
       const soloTypeRaw =
-        getValue(row, "soloType") || getValue(row, "solo type") || getValue(row, "solotype") || "";
+        getValue(row, "soloType") ||
+        getValue(row, "solo type") ||
+        getValue(row, "solo_type") ||
+        getValue(row, "solotype") ||
+        "";
 
       let category = rawCategory;
       let subCategory = rawSubCategory || null;
-      const profilePhoto = getValue(row, "profilePhoto") || null;
+      const profilePhotoRaw = getValue(row, "profilePhoto") || null;
+      const profilePhotos = profilePhotoRaw
+        ? String(profilePhotoRaw)
+            .split(",")
+            .map((x) => String(x).trim())
+            .filter(Boolean)
+        : [];
+      const profilePhoto = profilePhotos[0] || null;
       const bio = getValue(row, "bio") || null;
 
       // Normalize category/subCategory to the canonical values stored in season.
@@ -1425,8 +1445,20 @@ exports.bulkImportParticipants = async (req, res) => {
           phone,
           password: hashedPassword,
           profilePhoto,
+          profilePhotos: profilePhotos.length ? profilePhotos : undefined,
           bio,
         });
+      } else if (profilePhotos.length) {
+        // If participant exists, keep the first as cover and merge the gallery.
+        const existing = Array.isArray(participant.profilePhotos)
+          ? participant.profilePhotos
+          : participant.profilePhoto
+            ? [participant.profilePhoto]
+            : [];
+        const merged = Array.from(new Set([...existing, ...profilePhotos]));
+        participant.profilePhotos = merged;
+        if (!participant.profilePhoto && merged[0]) participant.profilePhoto = merged[0];
+        await participant.save();
       }
 
       /** 🔁 Prevent duplicate category entry */
@@ -1547,13 +1579,16 @@ exports.bulkImportParticipants = async (req, res) => {
             }
           }
         } else {
-          // Only create if we have participants captured for this round
-          if (data?.participantIds?.length) {
+          /**
+           * Create the round even if the CSV rows were skipped (e.g. duplicates),
+           * as long as we have metadata for the groupKey from the sheet.
+           */
+          if (meta || data?.participantIds?.length) {
             freshSeason.rounds.push({
               name: roundName,
-              category: meta?.category || data.category,
-              subCategory: meta?.subCategory || data.subCategory,
-              participants: data.participantIds,
+              category: meta?.category || data?.category,
+              subCategory: meta?.subCategory || data?.subCategory,
+              participants: data?.participantIds?.length ? data.participantIds : [],
               status: "active",
               startDate: now,
               endDate: end,
@@ -1763,7 +1798,17 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
     // -----------------------------
     // 7️⃣ Sort by stars (leaderboard)
     // -----------------------------
-    filteredResponse.sort((a, b) => b.totalStars - a.totalStars);
+    filteredResponse.sort((a, b) => {
+      const byAvg = Number(b.avgStars || 0) - Number(a.avgStars || 0);
+      if (byAvg !== 0) return byAvg;
+
+      // tie-breaker: higher total stars wins (more support)
+      const byTotal = Number(b.totalStars || 0) - Number(a.totalStars || 0);
+      if (byTotal !== 0) return byTotal;
+
+      // final tie-breaker: consistent alphabetical order
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
 
     // -----------------------------
     // 8️⃣ Final response
