@@ -6,12 +6,12 @@ const ParticipantSchema = new Schema(
     name: {
       type: String,
       required: true,
+      trim: true,
     },
 
     email: {
       type: String,
       required: true,
-      unique: true,
       lowercase: true,
       trim: true,
     },
@@ -123,4 +123,13 @@ const ParticipantSchema = new Schema(
   { timestamps: true }
 );
 
-module.exports = mongoose.model('Participant', ParticipantSchema);
+// Same parent email, different children → different rows (see Documentation/ParticipantsUpload/EmailPlusNamePlan.md)
+ParticipantSchema.index({ email: 1, name: 1 }, { unique: true });
+
+ParticipantSchema.pre("save", function (next) {
+  if (this.name) this.name = String(this.name).trim();
+  if (this.email) this.email = String(this.email).trim().toLowerCase();
+  next();
+});
+
+module.exports = mongoose.model("Participant", ParticipantSchema);

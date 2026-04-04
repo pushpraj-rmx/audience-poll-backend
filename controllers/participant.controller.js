@@ -8,6 +8,10 @@ const jwt = require("jsonwebtoken");
 // const User = require("../models/User");
 const Season = require("../models/seasons");
 const { getFileUrl } = require("../utils/fileHelper");
+const {
+  normalizeParticipantName,
+  normalizeParticipantEmail,
+} = require("../utils/participantIdentity");
 
 function escapeRegex(input = "") {
   return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -115,6 +119,7 @@ exports.createParticipant = async (req, res) => {
       memberName,
       memberCategory,
       chapterName,
+      name,
       ...rest
     } = req.body;
 
@@ -123,6 +128,21 @@ exports.createParticipant = async (req, res) => {
         message: "seasonId and category are required",
       });
     }
+
+    if (!email || !password) {
+      return res.status(400).json({
+        message: "email and password are required",
+      });
+    }
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({
+        message: "name is required",
+      });
+    }
+
+    const emailNorm = normalizeParticipantEmail(email);
+    const nameNorm = normalizeParticipantName(name);
 
     // 🔍 Find season
     const season = await Season.findById(seasonId);
@@ -165,8 +185,11 @@ exports.createParticipant = async (req, res) => {
           : `${category}|${subCategory}`
         : null;
 
-    // 🔍 Find participant
-    let participant = await Participant.findOne({ email });
+    // 🔍 Find participant (email + display name — same email can be multiple children)
+    let participant = await Participant.findOne({
+      email: emailNorm,
+      name: nameNorm,
+    });
 
     // 🖼️ Profile image
     let profileUrl;
@@ -182,7 +205,8 @@ exports.createParticipant = async (req, res) => {
 
       participant = new Participant({
         ...rest,
-        email,
+        name: nameNorm,
+        email: emailNorm,
         password: hashedPassword,
         profilePhoto: profileUrl,
       });
@@ -286,7 +310,7 @@ exports.createParticipant = async (req, res) => {
 
 exports.loginParticipant = async (req, res) => {
   try {
-    const { email, password, seasonSlug } = req.body;
+    const { email, password, seasonSlug, name: loginName } = req.body;
 
     if (!email || !password || !seasonSlug) {
       return res.status(400).json({
@@ -317,9 +341,29 @@ exports.loginParticipant = async (req, res) => {
     }
 
     /* =========================
-       2️⃣ FIND PARTICIPANT
+       2️⃣ FIND PARTICIPANT (email + optional name if multiple share email)
     ========================= */
-    const participant = await Participant.findOne({ email });
+    const emailNorm = normalizeParticipantEmail(email);
+    let participant;
+    if (loginName && String(loginName).trim()) {
+      participant = await Participant.findOne({
+        email: emailNorm,
+        name: normalizeParticipantName(loginName),
+      });
+    } else {
+      const list = await Participant.find({ email: emailNorm });
+      if (list.length === 0) {
+        participant = null;
+      } else if (list.length > 1) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Multiple participants use this email. Send your full name in the \"name\" field to log in.",
+        });
+      } else {
+        participant = list[0];
+      }
+    }
     if (!participant) {
       return res.status(404).json({
         success: false,
@@ -428,9 +472,12 @@ exports.loginParticipant = async (req, res) => {
 // Get loggedInParticipant
 exports.getLoggedInParticipant = async (req, res) => {
   try {
-    const { email } = req.user;
+    const userId = req.user?.userId;
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid session" });
+    }
 
-    const participant = await Participant.findOne({ email })
+    const participant = await Participant.findById(userId)
       .select("-password")
       .populate("contests.contest");
     if (!participant)
@@ -914,7 +961,6 @@ exports.updateParticipantForSeason = async (req, res) => {
       memberCategory,
       chapterName,
     } = req.body;
-    console.log(req.body, "555555555555555555");
 
     if (
       !participantId ||
@@ -973,10 +1019,23 @@ exports.updateParticipantForSeason = async (req, res) => {
     /* =========================
        4️⃣ UPDATE PARTICIPANT PROFILE
     ========================= */
-    if (name) participant.name = name;
+    if (name) participant.name = normalizeParticipantName(name);
     if (phone) participant.phone = phone;
-    if (email) participant.email = email;
+    if (email) participant.email = normalizeParticipantEmail(email);
     if (profilePhoto) participant.profilePhoto = profilePhoto;
+
+    const identityClash = await Participant.findOne({
+      _id: { $ne: participant._id },
+      email: participant.email,
+      name: participant.name,
+    });
+    if (identityClash) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Another participant already uses this email and name combination",
+      });
+    }
 
     /* =========================
    🚫 PREVENT DUPLICATE CATEGORY + SUBCATEGORY
@@ -1352,7 +1411,7 @@ exports.bulkImportParticipants = async (req, res) => {
     /** 2️⃣ Process rows safely (async/await works here) */
     for (const row of rows) {
       const name = getValue(row, "name");
-      const email = getValue(row, "email").toLowerCase();
+      const email = normalizeParticipantEmail(getValue(row, "email"));
       const phone = getValue(row, "phone");
       // Support multiple header naming conventions from CSV.
       // Doc: Category Name (Column D) + Participation Type (Column E)
@@ -1432,15 +1491,20 @@ exports.bulkImportParticipants = async (req, res) => {
         continue;
       }
 
-      /** 🔍 Find or create participant */
-      let participant = await Participant.findOne({ email });
+      const normalizedName = normalizeParticipantName(name);
+
+      /** 🔍 Find or create participant (email + name — same email, different children = different docs) */
+      let participant = await Participant.findOne({
+        email,
+        name: normalizedName,
+      });
 
       if (!participant) {
         const rawPassword = phone.slice(-6);
         const hashedPassword = await bcrypt.hash(rawPassword, 10);
 
         participant = await Participant.create({
-          name,
+          name: normalizedName,
           email,
           phone,
           password: hashedPassword,
@@ -1448,17 +1512,24 @@ exports.bulkImportParticipants = async (req, res) => {
           profilePhotos: profilePhotos.length ? profilePhotos : undefined,
           bio,
         });
-      } else if (profilePhotos.length) {
-        // If participant exists, keep the first as cover and merge the gallery.
-        const existing = Array.isArray(participant.profilePhotos)
-          ? participant.profilePhotos
-          : participant.profilePhoto
-            ? [participant.profilePhoto]
-            : [];
-        const merged = Array.from(new Set([...existing, ...profilePhotos]));
-        participant.profilePhotos = merged;
-        if (!participant.profilePhoto && merged[0]) participant.profilePhoto = merged[0];
-        await participant.save();
+      } else {
+        let needsSave = false;
+        if (profilePhotos.length) {
+          const existing = Array.isArray(participant.profilePhotos)
+            ? participant.profilePhotos
+            : participant.profilePhoto
+              ? [participant.profilePhoto]
+              : [];
+          const merged = Array.from(new Set([...existing, ...profilePhotos]));
+          participant.profilePhotos = merged;
+          if (!participant.profilePhoto && merged[0]) participant.profilePhoto = merged[0];
+          needsSave = true;
+        }
+        if (phone && String(phone).trim()) {
+          participant.phone = String(phone).trim();
+          needsSave = true;
+        }
+        if (needsSave) await participant.save();
       }
 
       /** 🔁 Prevent duplicate category entry */
@@ -1637,7 +1708,7 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
       .select("contestId rounds")
       .populate({
         path: "rounds.participants",
-        select: "name email profilePhoto contests",
+        select: "name email profilePhoto profilePhotos contests",
         populate: {
           path: "contests.contest", // ⚠️ this is Season ref
           select: "_id",
@@ -1775,6 +1846,7 @@ exports.getRoundParticipantsWithStars = async (req, res) => {
         name: p.name,
         email: p.email,
         profilePhoto: p.profilePhoto,
+        profilePhotos: p.profilePhotos,
         category,
         groupKey: participantGroupKey,
         memberName,
