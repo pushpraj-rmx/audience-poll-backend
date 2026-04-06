@@ -1,5 +1,5 @@
 const express = require('express');
-const { total, getRegistrationsByContest, getStarsPerRoundForParticipant, getVotingAnalytics, getTotalStarsByContest, getTotalVoterByContest, getScanAnalytics, getParticipantContestsWithVotes, getPointTableByContest, getSuperAdminContestAnalytics, getUserAnalytics, getParticipantSeasonsWithVotes, getPointTableBySeason, totalsForSuperAdmin, getVotesPerSeasonForParticipant, getContestSeasonStats, getParticipantVoteAnalytics, groupLeaderboard, computeGroupWinners } = require('../controllers/analytics.controller');
+const { total, getRegistrationsByContest, getStarsPerRoundForParticipant, getVotingAnalytics, getTotalStarsByContest, getTotalVoterByContest, getScanAnalytics, getParticipantContestsWithVotes, getPointTableByContest, getSuperAdminContestAnalytics, getUserAnalytics, getParticipantSeasonsWithVotes, getPointTableBySeason, getParticipantRoundAudit, totalsForSuperAdmin, getVotesPerSeasonForParticipant, getContestSeasonStats, getParticipantVoteAnalytics, groupLeaderboard, computeGroupWinners } = require('../controllers/analytics.controller');
 const { protect } = require('../middlewares/auth');
 const router = express.Router();
 
@@ -7,6 +7,11 @@ router.get("/contest-season-stats",getContestSeasonStats)
 router.get("/total-super-admin",protect(["super_admin"]), totalsForSuperAdmin)
 router.get("/votes", getVotingAnalytics);
 router.get("/point-table", getPointTableBySeason);
+router.get(
+  "/participant-round-audit",
+  protect(["admin", "super_admin", "sponsor", "judge"]),
+  getParticipantRoundAudit,
+);
 router.get("/group-leaderboard", groupLeaderboard);
 router.post(
   "/compute-group-winners",

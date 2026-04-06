@@ -1,14 +1,15 @@
 /**
- * Most Talented Chapter — Phase B1 (core calculation only, no HTTP).
- * Reads Participant + Vote; does not mutate existing documents.
+ * Most Talented Chapter — read-only aggregate (Participant + Vote).
  *
- * Rules: Documentation/MostTalentedChapter/README.md
- * - P_headcount: unique participants per chapter (active contests for this season).
- * - P_first_in_category: ×3 per #1 per **groupKey** from vote leaderboard (avg stars). **roundId** = that round only;
- *   **no roundId** = all rounds combined (votes merged across season, same formula style as point table).
- * - P_group_participation: +5 if chapter has any active Group subCategory entry.
- * - P_group_placement: max of 15/10/5 from Group entries (first/second/third) per chapter.
- * - P_audience_average: mean of per-participant audience avg for that chapter; **roundId** = one round; **no roundId** = all rounds.
+ * First×3 and Group rank (15/10/5) both use the same live leaderboard rule:
+ * per `groupKey`, sort by avgStars (audience+judge, same formula as point table),
+ * tie-break earlier `registeredAt`. No reliance on stored `contests.position`.
+ *
+ * - P_headcount: unique participants per chapter (active season entries).
+ * - P_first_in_category: ×3 per #1 per groupKey (leaderboard).
+ * - P_group_participation: +5 if any active entry has subCategory Group.
+ * - P_group_placement: max 15/10/5 from top-3 per groupKey (leaderboard).
+ * - P_audience_average: mean audience avg per participant (optional round).
  */
 
 const mongoose = require("mongoose");
@@ -18,6 +19,8 @@ const Season = require("../models/seasons");
 
 const POINTS_PER_FIRST = 3;
 const GROUP_PARTICIPATION_BONUS = 5;
+/** Index 0 = 1st place, 1 = 2nd, 2 = 3rd per groupKey */
+const PODIUM_PLACEMENT_POINTS = [15, 10, 5];
 
 function normalizeChapterName(raw) {
   const s = raw != null ? String(raw).trim() : "";
@@ -28,14 +31,6 @@ function isGroupSubCategory(subCategory) {
   return String(subCategory || "")
     .trim()
     .toLowerCase() === "group";
-}
-
-function groupPlacementPoints(position) {
-  const p = String(position || "").trim().toLowerCase();
-  if (p === "first") return 15;
-  if (p === "second") return 10;
-  if (p === "third") return 5;
-  return 0;
 }
 
 /** Same pattern as participant registration / groupKey in DB. */
@@ -53,9 +48,8 @@ function buildGroupKey(c) {
 }
 
 /**
- * Per-participant avgStars for one round — aligned with `getPointTableBySeason` row formula
- * (avgAudienceStars + avgJudgeStars from raw vote sums for that round).
- * @returns {Map<string, number>} participantId string -> avgStars
+ * Per-participant avgStars for one round — aligned with point-table row formula.
+ * @returns {Map<string, number>}
  */
 async function aggregateAvgStarsByParticipantForRound(seasonId, roundId) {
   const seasonObjectId = new mongoose.Types.ObjectId(seasonId);
@@ -78,8 +72,6 @@ async function aggregateAvgStarsByParticipantForRound(seasonId, roundId) {
           roundId: "$roundId",
           seasonId: "$seasonId",
         },
-        totalPoints: { $sum: "$stars" },
-        totalVotes: { $sum: 1 },
         audiencePoints: {
           $sum: {
             $cond: [{ $eq: ["$voterType", "audience"] }, "$stars", 0],
@@ -137,8 +129,8 @@ async function aggregateAvgStarsByParticipantForRound(seasonId, roundId) {
 }
 
 /**
- * All rounds in season merged per participant — same avgStars formula as point-table rows, collapsed to one score.
- * @returns {Map<string, number>} participantId string -> avgStars
+ * All rounds merged — same avgStars formula, one score per participant.
+ * @returns {Map<string, number>}
  */
 async function aggregateAvgStarsByParticipantAllRounds(seasonId) {
   const seasonObjectId = new mongoose.Types.ObjectId(seasonId);
@@ -212,33 +204,14 @@ async function aggregateAvgStarsByParticipantAllRounds(seasonId) {
 }
 
 /**
- * For each distinct groupKey, pick winner by max avgStars (same round), tie-break earlier registeredAt.
- * @returns {Map<string, number>} chapterName -> count of groupKeys won (first place)
+ * Audience avg (unique voters) per participant — one round.
+ * @returns {Map<string, number>}
  */
-function computeFirstWinsByChapterFromLeaderboard(competitorsByGroupKey, avgStarsByParticipant) {
-  /** @type {Map<string, number>} */
-  const wins = new Map();
-
-  for (const [, entries] of competitorsByGroupKey) {
-    if (!entries.length) continue;
-    const sorted = [...entries].sort((a, b) => {
-      const as = avgStarsByParticipant.get(a.participantId) ?? 0;
-      const bs = avgStarsByParticipant.get(b.participantId) ?? 0;
-      if (bs !== as) return bs - as;
-      return a.registeredAtMs - b.registeredAtMs;
-    });
-    const w = sorted[0];
-    const ch = w.chapterName;
-    wins.set(ch, (wins.get(ch) || 0) + 1);
-  }
-  return wins;
-}
-
-/**
- * Audience avg (stars per unique voter) per participant — same spirit as analytics.controller group flow.
- * @returns {Map<string, number>} participantId string -> avg
- */
-async function aggregateAudienceAvgByParticipantIds(participantObjectIds, seasonId, roundId) {
+async function aggregateAudienceAvgByParticipantIds(
+  participantObjectIds,
+  seasonId,
+  roundId,
+) {
   if (!participantObjectIds.length || !roundId) return new Map();
 
   const seasonObjectId = new mongoose.Types.ObjectId(seasonId);
@@ -277,7 +250,10 @@ async function aggregateAudienceAvgByParticipantIds(participantObjectIds, season
     },
     {
       $group: {
-        _id: { participantId: "$participantId", voterIdentifier: "$voterIdentifier" },
+        _id: {
+          participantId: "$participantId",
+          voterIdentifier: "$voterIdentifier",
+        },
         starsSum: { $sum: "$stars" },
       },
     },
@@ -302,10 +278,13 @@ async function aggregateAudienceAvgByParticipantIds(participantObjectIds, season
 }
 
 /**
- * Audience avg across **all rounds** in season (unique voter dedup across combined pipeline).
+ * Audience avg across all rounds (unique voter dedup in pipeline).
  * @returns {Map<string, number>}
  */
-async function aggregateAudienceAvgByParticipantIdsAllRounds(participantObjectIds, seasonId) {
+async function aggregateAudienceAvgByParticipantIdsAllRounds(
+  participantObjectIds,
+  seasonId,
+) {
   if (!participantObjectIds.length) return new Map();
 
   const seasonObjectId = new mongoose.Types.ObjectId(seasonId);
@@ -341,7 +320,10 @@ async function aggregateAudienceAvgByParticipantIdsAllRounds(participantObjectId
     },
     {
       $group: {
-        _id: { participantId: "$participantId", voterIdentifier: "$voterIdentifier" },
+        _id: {
+          participantId: "$participantId",
+          voterIdentifier: "$voterIdentifier",
+        },
         starsSum: { $sum: "$stars" },
       },
     },
@@ -366,25 +348,57 @@ async function aggregateAudienceAvgByParticipantIdsAllRounds(participantObjectId
 }
 
 /**
- * @param {{ seasonId: string, roundId?: string|null }} params
- * @returns {Promise<{
- *   seasonId: string,
- *   roundId: string|null,
- *   computedAt: string,
- *   warnings: string[],
- *   chapters: Array<{
- *     chapterName: string,
- *     pHeadcount: number,
- *     firstPlaceEntryCount: number,
- *     pFirstInCategory: number,
- *     pGroupParticipation: number,
- *     pGroupPlacement: number,
- *     pAudienceAverage: number,
- *     grandTotal: number,
- *     participantCountForAudience: number,
- *   }>
- * }>}
+ * @returns {Map<string, number>} chapterName -> count of groupKeys where this chapter is #1
  */
+function computeFirstWinsByChapterFromLeaderboard(
+  competitorsByGroupKey,
+  avgStarsByParticipant,
+) {
+  const wins = new Map();
+
+  for (const [, entries] of competitorsByGroupKey) {
+    if (!entries.length) continue;
+    const sorted = [...entries].sort((a, b) => {
+      const as = avgStarsByParticipant.get(a.participantId) ?? 0;
+      const bs = avgStarsByParticipant.get(b.participantId) ?? 0;
+      if (bs !== as) return bs - as;
+      return a.registeredAtMs - b.registeredAtMs;
+    });
+    const w = sorted[0];
+    const ch = w.chapterName;
+    wins.set(ch, (wins.get(ch) || 0) + 1);
+  }
+  return wins;
+}
+
+/**
+ * Top 3 per groupKey → 15/10/5 to that row’s chapter; chapter max across keys.
+ * @returns {Map<string, number>} chapterName -> best placement points
+ */
+function computeGroupPlacementByChapterFromLeaderboard(
+  competitorsByGroupKey,
+  avgStarsByParticipant,
+) {
+  const best = new Map();
+
+  for (const [, entries] of competitorsByGroupKey) {
+    if (!entries.length) continue;
+    const sorted = [...entries].sort((a, b) => {
+      const as = avgStarsByParticipant.get(a.participantId) ?? 0;
+      const bs = avgStarsByParticipant.get(b.participantId) ?? 0;
+      if (bs !== as) return bs - as;
+      return a.registeredAtMs - b.registeredAtMs;
+    });
+    const topN = Math.min(3, sorted.length);
+    for (let i = 0; i < topN; i++) {
+      const pts = PODIUM_PLACEMENT_POINTS[i];
+      const ch = sorted[i].chapterName;
+      best.set(ch, Math.max(best.get(ch) ?? 0, pts));
+    }
+  }
+  return best;
+}
+
 async function computeMostTalentedChapterScores({ seasonId, roundId = null }) {
   if (!seasonId || !mongoose.Types.ObjectId.isValid(seasonId)) {
     throw new Error("Invalid or missing seasonId");
@@ -399,25 +413,26 @@ async function computeMostTalentedChapterScores({ seasonId, roundId = null }) {
   const warnings = [];
   if (!roundId) {
     warnings.push(
-      "All rounds: First×3 and audience use votes merged across the whole season (no single round).",
+      "All rounds: First×3, group rank, and audience use votes merged across the whole season (no single round).",
     );
   } else {
     if (!mongoose.Types.ObjectId.isValid(roundId)) {
       throw new Error("Invalid roundId");
     }
-    const roundOk = (season.rounds || []).some((r) => String(r?._id) === String(roundId));
+    const roundOk = (season.rounds || []).some(
+      (r) => String(r?._id) === String(roundId),
+    );
     if (!roundOk) {
       throw new Error("roundId does not belong to this season");
     }
     warnings.push(
-      "Single round: First×3 and audience use only this round’s votes.",
+      "Single round: First×3, group rank, and audience use only this round’s votes.",
     );
   }
 
-  /** @type {Map<string, { participantIds: Set<string>, hasGroupParticipation: boolean, groupPlacementScores: number[] }>} */
+  /** @type {Map<string, { participantIds: Set<string>, hasGroupParticipation: boolean }>} */
   const byChapter = new Map();
 
-  /** groupKey -> competitors (leaderboard first-place, all rounds or one round) */
   const competitorsByGroupKey = new Map();
   const seenParticipantGroupKey = new Set();
 
@@ -439,45 +454,47 @@ async function computeMostTalentedChapterScores({ seasonId, roundId = null }) {
         byChapter.set(chapter, {
           participantIds: new Set(),
           hasGroupParticipation: false,
-          groupPlacementScores: [],
         });
       }
       const agg = byChapter.get(chapter);
       agg.participantIds.add(pid);
 
-      {
-        const gk = buildGroupKey(c);
-        if (gk) {
-          const pairKey = `${pid}|${gk}`;
-          if (!seenParticipantGroupKey.has(pairKey)) {
-            seenParticipantGroupKey.add(pairKey);
-            if (!competitorsByGroupKey.has(gk)) {
-              competitorsByGroupKey.set(gk, []);
-            }
-            const regMs = c.registeredAt ? new Date(c.registeredAt).getTime() : 0;
-            competitorsByGroupKey.get(gk).push({
-              participantId: pid,
-              chapterName: normalizeChapterName(c.chapterName),
-              registeredAtMs: regMs,
-            });
+      const gk = buildGroupKey(c);
+      if (gk) {
+        const pairKey = `${pid}|${gk}`;
+        if (!seenParticipantGroupKey.has(pairKey)) {
+          seenParticipantGroupKey.add(pairKey);
+          if (!competitorsByGroupKey.has(gk)) {
+            competitorsByGroupKey.set(gk, []);
           }
+          const regMs = c.registeredAt
+            ? new Date(c.registeredAt).getTime()
+            : 0;
+          competitorsByGroupKey.get(gk).push({
+            participantId: pid,
+            chapterName: normalizeChapterName(c.chapterName),
+            registeredAtMs: regMs,
+          });
         }
       }
 
       if (isGroupSubCategory(c.subCategory)) {
         agg.hasGroupParticipation = true;
-        agg.groupPlacementScores.push(groupPlacementPoints(c.position));
       }
     }
   }
 
-  /** @type {Map<string, number>} */
   let firstWinsByChapter = new Map();
+  let groupPlacementByChapter = new Map();
   if (competitorsByGroupKey.size > 0) {
     const avgStarsByParticipant = roundId
       ? await aggregateAvgStarsByParticipantForRound(seasonId, roundId)
       : await aggregateAvgStarsByParticipantAllRounds(seasonId);
     firstWinsByChapter = computeFirstWinsByChapterFromLeaderboard(
+      competitorsByGroupKey,
+      avgStarsByParticipant,
+    );
+    groupPlacementByChapter = computeGroupPlacementByChapterFromLeaderboard(
       competitorsByGroupKey,
       avgStarsByParticipant,
     );
@@ -495,8 +512,15 @@ async function computeMostTalentedChapterScores({ seasonId, roundId = null }) {
   }
 
   const audienceMap = roundId
-    ? await aggregateAudienceAvgByParticipantIds(allParticipantObjectIds, seasonId, roundId)
-    : await aggregateAudienceAvgByParticipantIdsAllRounds(allParticipantObjectIds, seasonId);
+    ? await aggregateAudienceAvgByParticipantIds(
+        allParticipantObjectIds,
+        seasonId,
+        roundId,
+      )
+    : await aggregateAudienceAvgByParticipantIdsAllRounds(
+        allParticipantObjectIds,
+        seasonId,
+      );
 
   const chapters = [];
 
@@ -504,9 +528,10 @@ async function computeMostTalentedChapterScores({ seasonId, roundId = null }) {
     const pHeadcount = agg.participantIds.size;
     const firstPlaceEntryCount = firstWinsByChapter.get(chapterName) || 0;
     const pFirstInCategory = firstPlaceEntryCount * POINTS_PER_FIRST;
-    const pGroupParticipation = agg.hasGroupParticipation ? GROUP_PARTICIPATION_BONUS : 0;
-    const pGroupPlacement =
-      agg.groupPlacementScores.length > 0 ? Math.max(...agg.groupPlacementScores) : 0;
+    const pGroupParticipation = agg.hasGroupParticipation
+      ? GROUP_PARTICIPATION_BONUS
+      : 0;
+    const pGroupPlacement = groupPlacementByChapter.get(chapterName) || 0;
 
     let sumAudience = 0;
     let nAudience = 0;

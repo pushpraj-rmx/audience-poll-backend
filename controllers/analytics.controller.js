@@ -2128,6 +2128,8 @@ exports.getPointTableBySeason = async (req, res) => {
           chapterName: "$seasonRegistration.chapterName",
           totalPoints: 1,
           totalVotes: 1,
+          audienceVotes: 1,
+          judgesVotes: 1,
           avgAudienceStars: {
             $cond: [
               { $gt: ["$audienceVotes", 0] },
@@ -2155,12 +2157,105 @@ exports.getPointTableBySeason = async (req, res) => {
 
     const data = await Vote.aggregate(pipeline);
 
+    const scanAgg = await QrScanLog.aggregate([
+      { $match: { seasonId: seasonObjectId } },
+      {
+        $group: {
+          _id: {
+            participantId: "$participantId",
+            roundname: "$roundname",
+          },
+          totalScans: { $sum: 1 },
+          qrSubmits: {
+            $sum: {
+              $cond: [
+                { $in: ["$step", ["info_submitted", "voted"]] },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]);
+
+    const scanByKey = new Map();
+    for (const row of scanAgg) {
+      const pid = row._id?.participantId?.toString?.();
+      const rk = row._id?.roundname;
+      if (!pid || rk === undefined || rk === null) continue;
+      const key = `${pid}|${String(rk)}`;
+      scanByKey.set(key, {
+        totalScans: row.totalScans || 0,
+        qrSubmits: row.qrSubmits || 0,
+      });
+    }
+
+    const submitMatch = {
+      seasonId: seasonObjectId,
+      step: "info_submitted",
+      isValid: true,
+      participantId: { $ne: null },
+      ...(roundIdFilter ? { roundId: roundIdFilter } : {}),
+    };
+    const pendingSubmitAgg = await Vote.aggregate([
+      { $match: submitMatch },
+      {
+        $group: {
+          _id: {
+            participantId: "$participantId",
+            roundId: "$roundId",
+          },
+          pendingSubmits: { $sum: 1 },
+        },
+      },
+    ]);
+    const pendingByKey = new Map();
+    for (const row of pendingSubmitAgg) {
+      const pid = row._id?.participantId?.toString?.();
+      const rid = row._id?.roundId?.toString?.();
+      if (!pid || !rid) continue;
+      pendingByKey.set(`${pid}|${rid}`, row.pendingSubmits || 0);
+    }
+
+    const resolveScanStats = (participantId, roundId, roundNameStr) => {
+      const pid = participantId?.toString?.();
+      const rid = roundId?.toString?.();
+      const rname = String(roundNameStr || "").toLowerCase();
+      const keys = [`${pid}|${rid}`, `${pid}|${rname}`].filter(
+        (k) => !k.includes("undefined"),
+      );
+      for (const k of keys) {
+        if (scanByKey.has(k)) return scanByKey.get(k);
+      }
+      return { totalScans: 0, qrSubmits: 0 };
+    };
+
+    const merged = data.map((row) => {
+      const pid = row.participantId;
+      const rid = row.roundId;
+      const stats = resolveScanStats(pid, rid, row.roundName);
+      const pending =
+        pendingByKey.get(`${pid?.toString?.()}|${rid?.toString?.()}`) || 0;
+      const finalVotes = Number(row.totalVotes || 0);
+      // Submits = completed final votes + still at info_submitted; QR log funnel when tracked
+      const totalSubmits = Math.max(
+        pending + finalVotes,
+        Number(stats.qrSubmits || 0),
+      );
+      return {
+        ...row,
+        totalScans: stats.totalScans,
+        totalSubmits,
+      };
+    });
+
     return res.status(200).json({
       success: true,
       seasonId,
       roundName: roundName || null,
       category: category || null,
-      data,
+      data: merged,
     });
   } catch (error) {
     console.error("Error in getPointTableBySeason:", error);
@@ -2172,6 +2267,225 @@ exports.getPointTableBySeason = async (req, res) => {
   }
 };
 
+/**
+ * Admin drill-down: scans audit + vote breakdown (audience / judges with emails) for one participant+round.
+ * Query: seasonId, participantId, roundId (all required)
+ */
+exports.getParticipantRoundAudit = async (req, res) => {
+  try {
+    const { seasonId, participantId, roundId } = req.query;
+
+    if (
+      !seasonId ||
+      !participantId ||
+      !roundId ||
+      !mongoose.Types.ObjectId.isValid(seasonId) ||
+      !mongoose.Types.ObjectId.isValid(participantId) ||
+      !mongoose.Types.ObjectId.isValid(roundId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid seasonId, participantId, and roundId are required",
+      });
+    }
+
+    const seasonObjectId = new mongoose.Types.ObjectId(seasonId);
+    const participantObjectId = new mongoose.Types.ObjectId(participantId);
+    const roundObjectId = new mongoose.Types.ObjectId(roundId);
+
+    const [participant, season] = await Promise.all([
+      Participant.findById(participantObjectId)
+        .select("name email phone profilePhoto contests")
+        .lean(),
+      Season.findById(seasonObjectId).select("rounds title").lean(),
+    ]);
+
+    if (!participant) {
+      return res.status(404).json({
+        success: false,
+        message: "Participant not found",
+      });
+    }
+
+    const roundDoc = season?.rounds?.find(
+      (r) => String(r?._id) === String(roundId),
+    );
+    const roundName = roundDoc?.name || "";
+    const roundIdStr = String(roundObjectId);
+    const roundNameLower = String(roundName || "").toLowerCase();
+
+    const scanRoundOr = [{ roundname: roundIdStr }];
+    if (roundNameLower) scanRoundOr.push({ roundname: roundNameLower });
+    if (roundName && roundName !== roundNameLower) {
+      scanRoundOr.push({ roundname: roundName });
+    }
+
+    const scans = await QrScanLog.find({
+      seasonId: seasonObjectId,
+      participantId: participantObjectId,
+      $or: scanRoundOr,
+    })
+      .sort({ scannedAt: -1, createdAt: -1 })
+      .lean();
+
+    const voteBase = {
+      seasonId: seasonObjectId,
+      participantId: participantObjectId,
+      roundId: roundObjectId,
+      isValid: true,
+    };
+
+    const roleLabel = (vt) => {
+      const m = {
+        audience: "Audience",
+        judge: "Judge",
+        sponsor: "Sponsor",
+        admin: "Admin",
+        super_admin: "Super admin",
+      };
+      return m[vt] || vt || "—";
+    };
+
+    const [finalVotes, pendingInfoVotesRaw] = await Promise.all([
+      Vote.find({ ...voteBase, step: "final" })
+        .populate("voterId", "name email phone role")
+        .sort({ createdAt: -1 })
+        .lean(),
+      Vote.find({ ...voteBase, step: "info_submitted" })
+        .populate("voterId", "name email phone role")
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
+
+    const pendingVotes = pendingInfoVotesRaw.map((v) => ({
+      _id: v._id,
+      name:
+        (v.voterDetails && v.voterDetails.name) ||
+        (v.voterId && v.voterId.name) ||
+        "—",
+      email:
+        (v.voterDetails && v.voterDetails.email) ||
+        (v.voterId && v.voterId.email) ||
+        "—",
+      phone:
+        (v.voterDetails && v.voterDetails.phone) ||
+        (v.voterId && v.voterId.phone) ||
+        "—",
+      voterType: v.voterType,
+      role: roleLabel(v.voterType),
+      createdAt: v.createdAt,
+    }));
+
+    const audienceVotes = [];
+    const judgeVotes = [];
+
+    for (const v of finalVotes) {
+      const isAudience = v.voterType === "audience";
+      const name =
+        (v.voterDetails && v.voterDetails.name) ||
+        (v.voterId && v.voterId.name) ||
+        "—";
+      const email =
+        (v.voterDetails && v.voterDetails.email) ||
+        (v.voterId && v.voterId.email) ||
+        "—";
+      const phone =
+        (v.voterDetails && v.voterDetails.phone) ||
+        (v.voterId && v.voterId.phone) ||
+        "—";
+
+      const row = {
+        _id: v._id,
+        voterType: v.voterType,
+        stars: v.stars ?? null,
+        name,
+        email,
+        phone,
+        createdAt: v.createdAt,
+      };
+
+      if (isAudience) audienceVotes.push(row);
+      else judgeVotes.push(row);
+    }
+
+    const audiencePoints = audienceVotes.reduce(
+      (s, r) => s + (Number(r.stars) || 0),
+      0,
+    );
+    const judgePoints = judgeVotes.reduce(
+      (s, r) => s + (Number(r.stars) || 0),
+      0,
+    );
+    const audienceCount = audienceVotes.length;
+    const judgeCount = judgeVotes.length;
+
+    const qrSubmits = scans.reduce(
+      (n, s) =>
+        n + (["info_submitted", "voted"].includes(s.step) ? 1 : 0),
+      0,
+    );
+    const totalSubmits = Math.max(
+      pendingVotes.length + finalVotes.length,
+      qrSubmits,
+    );
+
+    return res.status(200).json({
+      success: true,
+      seasonId,
+      participantId,
+      roundId,
+      roundName: roundName || null,
+      participant: {
+        _id: participant._id,
+        name: participant.name,
+        email: participant.email,
+        phone: participant.phone,
+        profilePhoto: participant.profilePhoto || null,
+      },
+      pendingVotes,
+      totals: {
+        totalScans: scans.length,
+        totalSubmits,
+        pendingInfoSubmits: pendingVotes.length,
+        totalVoters: finalVotes.length,
+        totalPoints: audiencePoints + judgePoints,
+        audience: {
+          count: audienceCount,
+          totalPoints: audiencePoints,
+          avgScore: audienceCount > 0 ? audiencePoints / audienceCount : 0,
+        },
+        judges: {
+          count: judgeCount,
+          totalPoints: judgePoints,
+          avgScore: judgeCount > 0 ? judgePoints / judgeCount : 0,
+        },
+      },
+      scans: scans.map((s) => ({
+        _id: s._id,
+        step: s.step,
+        deviceId: s.deviceId || null,
+        ip: s.ip || null,
+        browser: s.browser || null,
+        browserVersion: s.browserVersion || null,
+        osName: s.osName || null,
+        userAgent: s.userAgent
+          ? String(s.userAgent).slice(0, 200)
+          : null,
+        scannedAt: s.scannedAt || s.createdAt,
+        createdAt: s.createdAt,
+      })),
+      audienceVotes,
+      judgeVotes,
+    });
+  } catch (error) {
+    console.error("Error in getParticipantRoundAudit:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch participant round audit",
+      error: error.message,
+    });
+  }
+};
 
 exports.getContestSeasonStats = async (req, res) => {
   try {

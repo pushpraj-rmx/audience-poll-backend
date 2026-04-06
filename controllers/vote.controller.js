@@ -59,6 +59,97 @@ async function resolveLoggedInVoter(req) {
   }
 }
 
+function digitsOnly(s) {
+  return String(s ?? "").replace(/\D/g, "");
+}
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Resolve judge/admin/sponsor from typed voter details (QR flow).
+ * Analytics use Vote.voterType — it is NOT read from User.role unless we match here.
+ * Tries email (exact + case-insensitive), then phone (exact + digit suffix) so
+ * 931223008 vs 9312230080 still match when appropriate.
+ */
+async function findStaffUserByVoterDetails(typedEmailRaw, typedPhoneRaw) {
+  const typedEmail = String(typedEmailRaw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s/g, "");
+
+  const staffRoleFilter = { role: { $in: Array.from(STAFF_ROLES) } };
+
+  if (typedEmail) {
+    let u = await User.findOne({
+      email: typedEmail,
+      status: "active",
+      ...staffRoleFilter,
+    })
+      .select("_id role")
+      .lean();
+    if (u) return u;
+
+    u = await User.findOne({
+      status: "active",
+      ...staffRoleFilter,
+      email: { $regex: new RegExp(`^${escapeRegex(typedEmail)}$`, "i") },
+    })
+      .select("_id role")
+      .lean();
+    if (u) return u;
+  }
+
+  const d = digitsOnly(typedPhoneRaw);
+  if (d.length < 8) return null;
+
+  const staffFilter = { status: "active", ...staffRoleFilter };
+
+  const rawPhone = String(typedPhoneRaw ?? "").trim();
+  if (rawPhone) {
+    const u = await User.findOne({
+      ...staffFilter,
+      phone: rawPhone,
+    })
+      .select("_id role")
+      .lean();
+    if (u) return u;
+  }
+
+  const uDigits = await User.findOne({
+    ...staffFilter,
+    phone: d,
+  })
+    .select("_id role")
+    .lean();
+  if (uDigits) return uDigits;
+
+  const last10 = d.slice(-10);
+  if (last10.length === 10) {
+    const u = await User.findOne({
+      ...staffFilter,
+      phone: { $regex: new RegExp(`${escapeRegex(last10)}$`) },
+    })
+      .select("_id role")
+      .lean();
+    if (u) return u;
+  }
+
+  const last9 = d.slice(-9);
+  if (last9.length >= 8) {
+    const u = await User.findOne({
+      ...staffFilter,
+      phone: { $regex: new RegExp(`${escapeRegex(last9)}$`) },
+    })
+      .select("_id role")
+      .lean();
+    if (u) return u;
+  }
+
+  return null;
+}
+
 // Helper to update Redis
 // async function updateRedisVote(contestId, participantId, stars) {
 //   const redisKey = `contest:${contestId}:votes`;
@@ -1481,36 +1572,13 @@ exports.submitFinalVote = async (req, res) => {
       });
     }
 
-    const typedEmail = String(voteInfo?.voterDetails?.email ?? "")
-      .trim()
-      .toLowerCase();
-    const typedPhone = String(voteInfo?.voterDetails?.phone ?? "").trim();
-
-    // If typed email/phone belongs to a staff user, use that staff role.
-    if (typedEmail) {
-      const typedUser = await User.findOne({
-        email: typedEmail,
-        status: "active",
-      })
-        .select("_id role")
-        .lean();
-
-      if (typedUser?.role && STAFF_ROLES.has(typedUser.role)) {
-        resolvedVoterType = typedUser.role;
-        resolvedVoterId = typedUser._id;
-      }
-    } else if (typedPhone) {
-      const typedUser = await User.findOne({
-        phone: typedPhone,
-        status: "active",
-      })
-        .select("_id role")
-        .lean();
-
-      if (typedUser?.role && STAFF_ROLES.has(typedUser.role)) {
-        resolvedVoterType = typedUser.role;
-        resolvedVoterId = typedUser._id;
-      }
+    const staffFromDetails = await findStaffUserByVoterDetails(
+      voteInfo?.voterDetails?.email,
+      voteInfo?.voterDetails?.phone,
+    );
+    if (staffFromDetails?.role && STAFF_ROLES.has(staffFromDetails.role)) {
+      resolvedVoterType = staffFromDetails.role;
+      resolvedVoterId = staffFromDetails._id;
     }
 
     const vote = await Vote.findOneAndUpdate(
