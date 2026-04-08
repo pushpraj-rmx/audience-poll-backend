@@ -1,6 +1,14 @@
 const express = require('express')
 const { protect } = require('../middlewares/auth')
-const { getAllAdmins, alladmin, getAdminsBySeason, adminRevote, adminResetAudienceVotes } = require('../controllers/admin.controller')
+const {
+  getAllAdmins,
+  alladmin,
+  getAdminsBySeason,
+  adminRevote,
+  adminResetAudienceVotes,
+  swapVoteVoterDetails,
+  ensureRenuAnubhavSwap,
+} = require('../controllers/admin.controller')
 const {
   getMostTalentedChapterScores,
   getMostTalentedChapterSnapshot,
@@ -19,6 +27,18 @@ router.post('/revote', protect(["super_admin", "admin"]), adminRevote)
 // Option A (bulk reset): reset audience votes for a participant+round.
 router.post('/reset-audience-votes', protect(["super_admin", "admin"]), adminResetAudienceVotes)
 
+router.post(
+  '/swap-vote-voter-details',
+  protect(["super_admin", "admin"]),
+  swapVoteVoterDetails,
+)
+
+router.post(
+  '/ensure-renu-anubhav-swap',
+  protect(["super_admin", "admin"]),
+  ensureRenuAnubhavSwap,
+)
+
 // Most Talented Chapter — specific paths before generic :seasonId
 router.get(
   '/most-talented-chapter/:seasonId/snapshot',
@@ -35,12 +55,5 @@ router.get(
   protect(["super_admin", "admin"]),
   getMostTalentedChapterScores,
 )
-
-// Phase 1 (revote): skeleton endpoint + auth + input validation.
-router.post('/revote', protect(["super_admin", "admin"]), adminRevote)
-
-// Option A (bulk reset): reset audience votes for a participant+round.
-router.post('/reset-audience-votes', protect(["super_admin", "admin"]), adminResetAudienceVotes)
-
 
 module.exports = router

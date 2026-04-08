@@ -5,6 +5,122 @@ const Season = require("../models/seasons");
 const { redis } = require("../config/redis");
 const Contest = require("../models/Contest");
 
+const STAFF_ROLES_SWAP = new Set([
+  "judge",
+  "admin",
+  "super_admin",
+  "sponsor",
+]);
+
+async function resolveVoterIdAfterDetailSwap(vote) {
+  if (vote.voterType === "audience") return null;
+  const email = String(vote.voterDetails?.email || "")
+    .trim()
+    .toLowerCase();
+  if (!email) return null;
+  const u = await User.findOne({
+    email,
+    status: "active",
+    role: { $in: Array.from(STAFF_ROLES_SWAP) },
+  })
+    .select("_id")
+    .lean();
+  return u?._id || null;
+}
+
+function escapeRegexForEmail(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Case-insensitive exact match on voterDetails.email */
+function emailMatchQuery(email) {
+  return {
+    $regex: new RegExp(`^${escapeRegexForEmail(email)}$`, "i"),
+  };
+}
+
+/**
+ * Swap voterDetails between two loaded Vote documents; saves both.
+ */
+async function persistSwapVoterDetailsBetweenVotes(a, b) {
+  const detA = {
+    name: a.voterDetails?.name ?? "",
+    email: a.voterDetails?.email ?? "",
+    phone: a.voterDetails?.phone ?? "",
+  };
+  const detB = {
+    name: b.voterDetails?.name ?? "",
+    email: b.voterDetails?.email ?? "",
+    phone: b.voterDetails?.phone ?? "",
+  };
+  a.voterDetails = {
+    name: detB.name,
+    email: detB.email,
+    phone: detB.phone,
+  };
+  b.voterDetails = {
+    name: detA.name,
+    email: detA.email,
+    phone: detA.phone,
+  };
+  a.voterId = await resolveVoterIdAfterDetailSwap(a);
+  b.voterId = await resolveVoterIdAfterDetailSwap(b);
+  a.markModified("voterDetails");
+  b.markModified("voterDetails");
+  await Promise.all([a.save(), b.save()]);
+}
+
+/** Preset pair for Reports → Audience & judges auto-fix (identity swap only). */
+const PRESET_RENU_EMAIL = "renuchabbra62@gmail.com";
+const PRESET_ANUBHAV_EMAIL = "rawatanubhav085@gmail.com";
+
+const ensureRenuAnubhavChains = new Map();
+
+/** Serialize preset checks per season+participant+round so concurrent requests cannot double-swap. */
+function runSerializedPresetSwap(key, fn) {
+  const prev = ensureRenuAnubhavChains.get(key) || Promise.resolve();
+  const out = prev.then(() => fn());
+  ensureRenuAnubhavChains.set(key, out.catch(() => {}));
+  return out;
+}
+
+async function performEnsureRenuAnubhavSwap(seasonId, participantId, roundId) {
+  const base = {
+    seasonId: new mongoose.Types.ObjectId(seasonId),
+    participantId: new mongoose.Types.ObjectId(participantId),
+    roundId: new mongoose.Types.ObjectId(roundId),
+    step: "final",
+    isValid: true,
+  };
+
+  const [voteRenu, voteAnubhav] = await Promise.all([
+    Vote.findOne({
+      ...base,
+      "voterDetails.email": emailMatchQuery(PRESET_RENU_EMAIL),
+    }),
+    Vote.findOne({
+      ...base,
+      "voterDetails.email": emailMatchQuery(PRESET_ANUBHAV_EMAIL),
+    }),
+  ]);
+
+  if (!voteRenu || !voteAnubhav) {
+    return { swapped: false, reason: "preset_pair_not_found" };
+  }
+
+  const needsSwap =
+    voteRenu.voterType === "audience" &&
+    voteAnubhav.voterType !== "audience";
+
+  if (!needsSwap) {
+    return { swapped: false, reason: "already_fixed_or_layout_ok" };
+  }
+
+  await persistSwapVoterDetailsBetweenVotes(voteRenu, voteAnubhav);
+
+  return { swapped: true, reason: "preset_renu_anubhav_swapped" };
+}
+
 exports.getAllAdmins = async (req, res) => {
   try {
     // Sanitize and parse page number
@@ -479,6 +595,127 @@ exports.adminResetAudienceVotes = async (req, res) => {
     });
   } catch (error) {
     console.error("Error in adminResetAudienceVotes:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * Swap voterDetails (name, email, phone) between two final votes for the same
+ * season + participant + round. Does not swap stars or voterType.
+ * Re-links voterId for staff votes from User by new email.
+ */
+exports.swapVoteVoterDetails = async (req, res) => {
+  try {
+    const { voteIdA, voteIdB } = req.body || {};
+    if (
+      !voteIdA ||
+      !voteIdB ||
+      !mongoose.Types.ObjectId.isValid(voteIdA) ||
+      !mongoose.Types.ObjectId.isValid(voteIdB)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "voteIdA and voteIdB (valid ObjectIds) are required",
+      });
+    }
+    if (String(voteIdA) === String(voteIdB)) {
+      return res.status(400).json({
+        success: false,
+        message: "Must be two different votes",
+      });
+    }
+
+    const [a, b] = await Promise.all([
+      Vote.findById(voteIdA),
+      Vote.findById(voteIdB),
+    ]);
+    if (!a || !b) {
+      return res.status(404).json({
+        success: false,
+        message: "One or both votes not found",
+      });
+    }
+
+    if (a.step !== "final" || b.step !== "final") {
+      return res.status(400).json({
+        success: false,
+        message: "Both votes must be final",
+      });
+    }
+
+    if (
+      String(a.seasonId) !== String(b.seasonId) ||
+      String(a.participantId) !== String(b.participantId) ||
+      String(a.roundId) !== String(b.roundId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Votes must belong to the same season, participant, and round",
+      });
+    }
+
+    await persistSwapVoterDetailsBetweenVotes(a, b);
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "Voter name, email, and phone swapped. Stars and audience/judge type unchanged.",
+      votes: [
+        {
+          _id: a._id,
+          voterType: a.voterType,
+          stars: a.stars,
+          voterDetails: a.voterDetails,
+        },
+        {
+          _id: b._id,
+          voterType: b.voterType,
+          stars: b.stars,
+          voterDetails: b.voterDetails,
+        },
+      ],
+    });
+  } catch (error) {
+    console.error("swapVoteVoterDetails:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * Idempotent: if Renu’s email is on an audience vote and Anubhav’s on a judge vote
+ * for this participant+round, swap only voterDetails (stars/types unchanged).
+ * If already corrected or votes missing, returns swapped: false.
+ */
+exports.ensureRenuAnubhavSwap = async (req, res) => {
+  try {
+    const { seasonId, participantId, roundId } = req.body || {};
+    if (
+      !seasonId ||
+      !participantId ||
+      !roundId ||
+      !mongoose.Types.ObjectId.isValid(seasonId) ||
+      !mongoose.Types.ObjectId.isValid(participantId) ||
+      !mongoose.Types.ObjectId.isValid(roundId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid seasonId, participantId, and roundId are required",
+      });
+    }
+
+    const key = `${seasonId}:${participantId}:${roundId}`;
+    const result = await runSerializedPresetSwap(key, () =>
+      performEnsureRenuAnubhavSwap(seasonId, participantId, roundId),
+    );
+
+    return res.status(200).json({
+      success: true,
+      swapped: result.swapped,
+      reason: result.reason,
+    });
+  } catch (error) {
+    console.error("ensureRenuAnubhavSwap:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
 };
